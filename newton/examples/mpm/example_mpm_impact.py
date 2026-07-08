@@ -508,6 +508,38 @@ class Example:
         parser.add_argument(
             "--force-law-plot", type=str, default=None, help="Optional path to save the force-law diagnostic plots."
         )
+
+        # stopping-time experiment (paper's hallmark: t_stop decreases with v0)
+        parser.add_argument(
+            "--stopping-time",
+            action="store_true",
+            help="Sweep impact speeds and plot stopping time vs impact speed.",
+        )
+        parser.add_argument(
+            "--stopping-time-speeds",
+            type=float,
+            nargs="+",
+            default=[1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5],
+            help="Impact speeds v0 [m/s] to sample for the stopping-time experiment.",
+        )
+        parser.add_argument(
+            "--stopping-time-plot",
+            type=str,
+            default="mpm_impact_stopping_time.png",
+            help="Path to save the stopping-time-vs-speed plot.",
+        )
+        parser.add_argument(
+            "--paper-d1",
+            type=float,
+            default=0.087,
+            help="Paper's inertial-drag length d1 [m] for the analytical stopping-time curve.",
+        )
+        parser.add_argument(
+            "--paper-k-over-m",
+            type=float,
+            default=1040.0,
+            help="Paper's friction coefficient k/m [s^-2] for the analytical stopping-time curve.",
+        )
         return parser
 
 
@@ -679,15 +711,157 @@ def _plot_force_law(path, di, vv, ff, depths, friction, beta, mass, stop_rows):
     print(f"saved force-law plots to {path}")
 
 
+# ----------------------------------------------------------------------
+# Stopping-time experiment: t_stop vs impact speed (the paper's hallmark)
+# ----------------------------------------------------------------------
+def _stopping_time_and_depth(rec: dict, surface: float, radius: float) -> tuple[float | None, float]:
+    """Return (stopping time [s], max penetration [m]) from a recorded impact.
+
+    Stopping time is the duration from surface entry to the *first* time the
+    ball ceases moving downward (robust to the approach gap and to any late slow
+    settling/creep after the ball has essentially stopped). Returns
+    ``(None, pen_max)`` if the ball did not clearly penetrate and stop.
+    """
+    pen = surface - (rec["z"] - radius)
+    vz = rec["vz"]
+    pen_max = float(pen.max())
+
+    entered = np.where((pen > 0.003) & (vz < -0.05))[0]
+    if entered.size < 1:
+        return None, pen_max
+    i0 = int(entered[0])
+    # first frame at/after entry where downward motion has ceased
+    stopped = np.where(vz[i0:] >= -0.05)[0]
+    if stopped.size < 1:
+        return None, pen_max  # never came to rest inside the recording window
+    i1 = i0 + int(stopped[0])
+    return float(rec["t"][i1] - rec["t"][i0]), pen_max
+
+
+def _analytical_stopping_time(v0: float, d1: float, k_over_m: float, g: float = GRAVITY) -> float:
+    """Stopping time from the paper's force law, integrated with RK4.
+
+    Solves ``dv/dt = g - v^2/d1 - (k/m) z`` (mass cancels) from surface entry
+    (``z=0``, ``v=v0``) until the ball's downward speed returns to zero, and
+    returns that time [s]. See Katsuragi & Durian (2007), Eq. (1).
+    """
+    dt = 1.0e-5
+    t_max = 2.0
+
+    def acc(z: float, v: float) -> float:
+        return g - v * v / d1 - k_over_m * z
+
+    z, v, t = 0.0, v0, 0.0
+    while v > 0.0 and t < t_max:
+        k1z, k1v = v, acc(z, v)
+        k2z, k2v = v + 0.5 * dt * k1v, acc(z + 0.5 * dt * k1z, v + 0.5 * dt * k1v)
+        k3z, k3v = v + 0.5 * dt * k2v, acc(z + 0.5 * dt * k2z, v + 0.5 * dt * k2v)
+        k4z, k4v = v + dt * k3v, acc(z + dt * k3z, v + dt * k3v)
+        v_new = v + (dt / 6.0) * (k1v + 2.0 * k2v + 2.0 * k3v + k4v)
+        if v_new <= 0.0:
+            return t + dt * v / (v - v_new)  # linear interpolation of the v=0 crossing
+        z += (dt / 6.0) * (k1z + 2.0 * k2z + 2.0 * k3z + k4z)
+        v = v_new
+        t += dt
+    return t
+
+
+def run_stopping_time(args):
+    import copy  # noqa: PLC0415
+
+    import newton.viewer  # noqa: PLC0415
+
+    speeds = sorted(float(s) for s in args.stopping_time_speeds)
+    d1, kom = float(args.paper_d1), float(args.paper_k_over_m)
+
+    print("\n=== stopping time vs impact speed ===")
+    print(f"paper model: d1 = {d1 * 100:.1f} cm, k/m = {kom:.0f} s^-2")
+    print(f"{'v0 [m/s]':>9} {'H [cm]':>8} {'t_sim [ms]':>11} {'t_paper [ms]':>13} {'pen [cm]':>9}")
+
+    v0s, tstops = [], []
+    for v0 in speeds:
+        run_args = copy.deepcopy(args)
+        run_args.drop_height = v0 * v0 / (2.0 * GRAVITY)
+        # no visible drop needed here; impact speed at the surface is preserved
+        run_args.approach_gap = 0.0
+
+        viewer = newton.viewer.ViewerNull(num_frames=args.num_frames)
+        example = Example(viewer, run_args)
+        radius = example.ball_radius
+        surface = example.bed_surface_z
+        rec = _record_impact(example, args.num_frames)
+        viewer.close()
+
+        t_pred = _analytical_stopping_time(v0, d1, kom)
+        t_stop, pen_max = _stopping_time_and_depth(rec, surface, radius)
+        if t_stop is None:
+            print(
+                f"{v0:>9.2f} {run_args.drop_height * 100:>8.2f} {'insufficient':>11} "
+                f"{t_pred * 1000:>13.1f} {pen_max * 100:>9.2f}"
+            )
+            continue
+        v0s.append(v0)
+        tstops.append(t_stop)
+        print(
+            f"{v0:>9.2f} {run_args.drop_height * 100:>8.2f} {t_stop * 1000:>11.1f} "
+            f"{t_pred * 1000:>13.1f} {pen_max * 100:>9.2f}"
+        )
+
+    if len(v0s) < 2:
+        print("\nNot enough valid impacts to plot. Try larger speeds or more frames.")
+        return
+
+    trend = "DECREASES" if tstops[-1] < tstops[0] else "increases"
+    print(f"\nstopping time {trend} as impact speed increases (paper: decreases).")
+    _plot_stopping_time(args.stopping_time_plot, v0s, tstops, d1, kom)
+
+
+def _plot_stopping_time(path: str, v0s: list[float], tstops: list[float], d1: float, k_over_m: float):
+    try:
+        import matplotlib  # noqa: PLC0415
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+    except ImportError:
+        print("matplotlib not available; skipping plot.")
+        return
+
+    # analytical curve from the paper's force law over the sampled speed range
+    v_fine = np.linspace(min(v0s), max(v0s), 100)
+    t_fine = np.array([_analytical_stopping_time(float(v), d1, k_over_m) for v in v_fine])
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.plot(v0s, np.asarray(tstops) * 1000.0, "o-", color="C3", lw=1.5, ms=7, label="Newton MPM")
+    ax.plot(
+        v_fine,
+        t_fine * 1000.0,
+        "--",
+        color="C0",
+        lw=1.8,
+        label=f"paper force law ($d_1$={d1 * 100:.1f} cm, $k/m$={k_over_m:.0f} s$^{{-2}}$)",
+    )
+    ax.set_xlabel(r"impact speed $v_0$ [m/s]")
+    ax.set_ylabel(r"stopping time $t_\mathrm{stop}$ [ms]")
+    ax.set_title("Granular impact: stopping time vs impact speed")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    print(f"saved stopping-time plot to {path}")
+
+
 if __name__ == "__main__":
     parser = Example.create_parser()
     viewer, args = newton.examples.init(parser)
 
-    if args.force_law:
-        # the force-law analysis manages its own headless (null) viewers per run
+    if args.force_law or args.stopping_time:
+        # these analyses manage their own headless (null) viewers per run
         import newton.viewer
 
         viewer.close()
-        run_force_law(args)
+        if args.force_law:
+            run_force_law(args)
+        else:
+            run_stopping_time(args)
     else:
         newton.examples.run(Example(viewer, args), args)
