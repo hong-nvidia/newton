@@ -751,7 +751,7 @@ add_example_test(
     TestDiffSimExamples,
     name="diffsim.example_diffsim_bear",
     devices=test_devices,
-    test_options={"usd_required": True, "num-frames": 4 * 60},  # train_iters * sim_steps
+    test_options={"usd_required": True, "num-frames": 160, "sim-steps": 30},  # 5 train iters
     test_options_cpu={"num-frames": 2, "sim-steps": 10},
     use_viewer=True,
 )
@@ -1004,6 +1004,13 @@ add_example_test(
     name="multiphysics.example_mujoco_mpm_coupled_solver",
     devices=cuda_test_devices,
     test_options={"num-frames": 2, "rigid-substeps": 1, "proxy-iterations": 1},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_anymal_mpm_coupled_solver",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 100, "onnx_required": True},
     use_viewer=True,
 )
 add_example_test(
